@@ -54,19 +54,15 @@ AI Coding 架构
 
 **LLM 推理与 Context Engineering / Serving**
 
-正在从：
+已完成：
 
 ```text
 Token / Attention
-    ↓
+  ↓
 KV Cache
-    ↓
+  ↓
 Prefix Cache
-```
-
-推进到：
-
-```text
+  ↓
 Continuous Batching
   ↓
 Prefill / Decode Scheduler
@@ -80,15 +76,16 @@ KV Block / Block Size
 Admission Control
   ↓
 KV Cache Eviction / Offloading / Preemption
+  ↓
+Prefill / Decode Disaggregation
 ```
 
-下一阶段准备进入：
+当前继续进入：
 
 ```text
-Prefill / Decode 分离
-→ Disaggregated Prefill/Decode
-→ KV Cache Transfer
-→ TTFT / ITL / Throughput
+KV Cache Transfer
+→ GPU Interconnect / Networking
+→ TTFT / ITL / Throughput 定量分析
 → LLM Serving 架构
 ```
 
@@ -217,7 +214,7 @@ LLM Decode 是逐步 autoregressive 的
 → 短请求结束后 GPU / batch slot 利用率下降
 ```
 
-需要继续细化：
+仍需细化：
 
 - token-level scheduling
 - batch 中不同 sequence length 的实际张量组织
@@ -312,17 +309,7 @@ Logical Block 1 → Physical Block 3
 Logical Block 2 → Physical Block 42
 ```
 
-所以逻辑上连续：
-
-```text
-[A0][A1][A2]
-```
-
-物理上可以不连续：
-
-```text
-Block 17 / Block 3 / Block 42
-```
+所以逻辑上连续、物理上可以不连续。
 
 核心收益：
 
@@ -355,40 +342,13 @@ A = 33 tokens
 → ceil(33 / 16) = 3 Blocks
 ```
 
-已经理解内部碎片：
-
-```text
-3 × 16 = 48 token capacity
-实际使用 = 33
-内部空余 = 15
-```
-
-Block Size Trade-off：
-
-```text
-Block 太小
-→ 内部碎片更少
-→ Block 数量增加
-→ Block Table / 管理开销增加
-→ Attention 访问管理更复杂
-
-Block 太大
-→ Block 数量少
-→ 管理更简单
-→ 最后一个 Block 内部碎片可能很大
-```
+已经理解内部碎片，以及 Block Size 在碎片、元数据和访问效率之间的 Trade-off。
 
 特别注意：
 
 > **未使用的 slot 仍属于该 Request 的最后一个 KV Block，通常不能简单切给另一个 Request。**
 
-系统可以记录：
-
-```text
-valid_tokens
-```
-
-用于表示最后一个 Block 中真正有效的 token 数。
+系统可以记录 `valid_tokens` 表示最后一个 Block 中真正有效的 token 数。
 
 ---
 
@@ -402,33 +362,11 @@ Request 生命周期
 KV Cache 生命周期
 ```
 
-例如 Request A 完成：
-
-```text
-A Finished
-   ↓
-A 不再需要运行时 KV
-```
-
-但其公共 Prefix KV 可能继续作为 Cache：
-
-```text
-Prefix Cache
-   ↓
-继续持有 Block
-```
-
-因此一个 Physical KV Block 可能由多个关系共同引用：
+公共 Prefix KV 可以在 Request 完成后继续作为 Cache 存活。
 
 ```text
 Request A → ref
 Prefix Cache → ref
-```
-
-A 完成：
-
-```text
-ref_count - 1
 ```
 
 只有：
@@ -463,7 +401,7 @@ Prefix Cache 命中多少
 GPU KV Pool 当前剩余多少
 ```
 
-所以核心思想：
+因此：
 
 ```text
 Request D
@@ -479,7 +417,7 @@ Request D
 决定 Admit / Wait / Preempt 等
 ```
 
-已经意识到：
+核心认知：
 
 > **不能把“Prefill 时新增 KV 的容量需求”误认为 Request 的全部未来显存需求。**
 
@@ -552,7 +490,7 @@ Preemption 的两种思路：
    → Transfer / CPU Memory ↑
 ```
 
-已经理解的重要区别：
+重要区别：
 
 ```text
 Finished
@@ -570,32 +508,195 @@ KV State
 
 ---
 
-# 4. 当前最重要的系统模型
+## 3.11 Prefill / Decode Disaggregation
 
-目前已经建立：
+已形成核心理解：
+
+传统 Aggregated Serving：
 
 ```text
-                         Requests
-                            │
-                            ▼
-                        Scheduler
-                            │
-           ┌────────────────┼────────────────┐
-           │                │                │
-        Admission       Batch/Token       Memory
-           │             Scheduling       Manager
-           │                │                │
-           ↓                ↓                ↓
-      Prefix Cache     Prefill/Decode     KV Blocks
-                              │                │
-                              └───────┬────────┘
-                                      ↓
-                                     GPU
+同一 GPU
+├─ Prefill
+└─ Decode
 ```
 
-核心理解已经从“模型怎么跑”转向：
+Disaggregated Serving：
 
-> **LLM Serving 本质上是在 GPU Compute、GPU KV Memory、CPU Memory、Latency、Throughput 之间持续做资源调度。**
+```text
+Request
+  ↓
+Router
+  ├─→ Prefill Pool
+  │      ↓
+  │   KV Generation
+  │      ↓
+  │   KV Transfer
+  │
+  └─→ Decode Pool
+         ↓
+       Decode
+```
+
+### P/D 为什么可以分离
+
+Prefill 与 Decode 的资源特征不同：
+
+```text
+Prefill
+→ 大量输入 token
+→ 更偏 Compute Intensive
+
+Decode
+→ 每轮少量新 token
+→ 多 Request 并发
+→ 对 ITL / tail latency 更敏感
+```
+
+因此可以独立配置 P/D Pool 的规模和并行策略。
+
+### P/D 不均衡
+
+已经理解这是一个 Pipeline Balance 问题：
+
+```text
+P 很慢
+→ KV 尚未 Ready
+→ D 即使有空闲资源
+→ 也无法对该 Request 开始 Decode
+```
+
+所以 P/D 分离把原本 GPU 内部的资源竞争转化为：
+
+```text
+Producer（Prefill）
+        ↓
+Intermediate Result（KV）
+        ↓
+Consumer（Decode）
+```
+
+### KV Transfer 成为新的关键路径
+
+第一次输出的路径可以抽象为：
+
+```text
+Queue
+→ Prefill
+→ KV Transfer
+→ Decode Admission
+→ First Decode
+→ First Token
+```
+
+因此：
+
+```text
+TTFT
+≈ Queue + Prefill + KV Transfer + Decode Admission + First Decode
+```
+
+已经理解 Critical Path 思维：如果 KV Transfer 占据主要时间，继续单独优化 Prefill 的边际收益会明显下降。
+
+### Block-level KV Transfer
+
+已经把 Paged KV / KV Block 与 P/D 分离连接起来：
+
+```text
+P 产生 KV Blocks
+        ↓
+Block-level Transfer
+        ↓
+D 的 KV Block Pool
+```
+
+KV Block 可以抽象出：
+
+```text
+PRODUCED
+  ↓
+TRANSFERRING
+  ↓
+READY
+  ↓
+ACTIVE
+  ↓
+RELEASED / EVICTED
+```
+
+已经认识到：
+
+> “KV 局部 Transfer”不等于“Decode 可以无条件立即开始”。Decode 所依赖的历史 KV Block 必须在对应计算需要前 Ready。
+
+### Router / Cache-aware Routing
+
+Router 不能只看 GPU utilization，还应考虑：
+
+```text
+KV Capacity
+KV Transfer Distance
+Current Decode Batch
+Prefix Cache Locality
+Priority / SLA
+Expected TTFT / ITL
+```
+
+初步 Cost Model：
+
+```text
+Cost(P, D, Request)
+≈ QueueWait(P)
+ + PrefillTime(P)
+ + KVTransferTime(P→D)
+ + DecodeQueueWait(D)
+ + ExpectedITL(D)
+```
+
+已经形成：
+
+> **Cache-aware Routing**：Prefix Cache 命中位置本身就是路由决策的一部分。
+
+---
+
+# 4. 当前最重要的系统模型
+
+```text
+                         Request
+                            │
+                            ▼
+                         Router
+                            │
+                  ┌─────────┴─────────┐
+                  ▼                   ▼
+             Prefill Pool        Decode Pool
+                  │                   ▲
+                  ▼                   │
+             KV Generation            │
+                  │                   │
+                  └── KV Transfer ────┘
+                            │
+                            ▼
+                          Decode
+```
+
+旁路机制：
+
+```text
+Prefix Cache
+    ↓
+Cache-aware Routing
+
+KV Memory Pressure
+    ↓
+Admission / Eviction / Preemption
+
+Long Prefill
+    ↓
+Chunked Prefill
+```
+
+核心理解已经从“模型怎么跑”升级到：
+
+> **LLM Serving 本质上是在 GPU Compute、GPU KV Memory、CPU Memory、KV Transfer、Latency、Throughput 之间持续做资源调度。**
 
 ---
 
@@ -605,14 +706,10 @@ KV State
 
 不准确。
 
-更准确：
-
 ```text
 Batch 成员动态变化
 → Scheduler 持续调度
 ```
-
----
 
 ## 误区 2：Chunk Size = KV Block Size
 
@@ -626,8 +723,6 @@ KV Block Size
 → KV 显存管理粒度
 ```
 
----
-
 ## 误区 3：Request Finished 就意味着 KV 必须释放
 
 不准确。
@@ -635,37 +730,59 @@ KV Block Size
 ```text
 Request Finished
 → 可以不再被运行时引用
-→ 但 Prefix Cache 可能继续引用其 Block
+→ Prefix Cache 可能继续引用其 Block
 ```
 
----
-
-## 误区 4：KV Block 剩余 slot 可以直接给别的 Request
-
-通常不这么做。
-
-```text
-Block 是固定大小的管理单位
-→ 最后一个 Block 的未使用 slot 通常仍属于当前 Request
-→ 由 valid_tokens 标识有效部分
-```
-
-因此存在内部碎片。
-
----
-
-## 误区 5：Prefill KV 容量 = Request 的全部 KV 显存需求
+## 误区 4：Prefill KV 容量 = Request 的全部 KV 显存需求
 
 不准确。
-
-还需要考虑：
 
 ```text
 Decode 持续生成
 → KV Cache 持续增长
 ```
 
-所以 Admission 时需要考虑未来增长或动态 Block 供应能力。
+## 误区 5：KV Transfer 局部完成就意味着 Decode 可以无条件开始
+
+不准确。
+
+```text
+必须保证当前 Decode 所依赖的 KV Blocks 已经 READY
+```
+
+## 误区 6：GPU Load 最低的 Worker 就一定是最佳路由目标
+
+不准确。
+
+还需要考虑：
+
+```text
+Queue
++ Cache Locality
++ KV Transfer
++ KV Capacity
++ Decode Batch
++ SLA
+```
+
+## 误区 7：Memory Bandwidth 决定 KV Cache Size
+
+不准确。
+
+严格区分：
+
+```text
+Compute
+→ 计算耗时
+
+Memory Capacity
+→ 能容纳多少 KV Cache
+
+Memory Bandwidth
+→ KV / 权重数据搬运吞吐
+```
+
+KV Cache Size 主要由 token 数、层数、KV heads、head dimension、数据类型等决定。
 
 ---
 
@@ -676,7 +793,7 @@ Decode 持续生成
 ```text
 ① Continuous Batching                ✅ 已形成核心理解
         ↓
-② Prefill / Decode Scheduler          ✅ 已形成初步理解
+② Prefill / Decode Scheduler          🟡 初步理解，仍需深入实现
         ↓
 ③ Chunked Prefill                    ✅ 已形成核心理解
         ↓
@@ -686,46 +803,61 @@ Decode 持续生成
         ↓
 ⑥ Prefix Cache 工程实现               ✅ 已形成基本理解
         ↓
-⑦ Admission Control                  ✅ 已开始理解
+⑦ Admission Control                  ✅ 已形成基本理解
         ↓
 ⑧ KV Cache Eviction / Offloading     ✅ 已形成基本理解
         ↓
 ⑨ KV Cache Preemption                ✅ 已形成基本理解
         ↓
-⑩ TTFT / ITL / Throughput            ⏳ 后续深化
+⑩ Prefill / Decode Disaggregation    ✅ 已形成核心理解
         ↓
-⑪ LLM Serving                        ⏳ 后续
+⑪ KV Cache Transfer                  ⏳ 下一环
+        ↓
+⑫ TTFT / ITL / Throughput            ⏳ 后续定量深化
+        ↓
+⑬ LLM Serving                        ⏳ 后续
 ```
 
 ---
 
-# 7. 下一阶段
+# 7. Session 2026-08-30
 
-下一课：
-
-**Disaggregated Prefill / Decode（Prefill/Decode 分离）**
-
-需要回答：
+## 本次主题
 
 ```text
-为什么 Prefill 和 Decode 的计算特征不同？
-为什么可以考虑把它们放到不同 GPU？
-KV Cache 如何从 Prefill GPU 转移到 Decode GPU？
-KV Transfer 的带宽 / 延迟会不会成为新的瓶颈？
+Continuous Batching
+→ Chunked Prefill
+→ Paged KV Cache / PagedAttention
+→ KV Block / Block Size
+→ Prefix Cache 引用计数
+→ Admission Control
+→ Eviction / Offloading / Preemption
+→ Prefill / Decode Disaggregation
 ```
 
-继续串联：
+## 本轮新增理解
+
+- P/D Disaggregation 把 Prefill 与 Decode 的资源竞争转化为 Producer → KV → Consumer 的流水线依赖。
+- P/D 不均衡本质上是 Pipeline Balance 问题；P 很慢时，D 即使有资源也可能因为 KV 未 Ready 而无法 Decode。
+- KV Transfer 进入 TTFT 的关键路径，不能只优化 Prefill 而忽略 Transfer。
+- KV 可以以 Block 为粒度进行 Transfer / Ready 状态管理，但 Decode 只能在其当前依赖的 KV Blocks Ready 后执行。
+- Router 不应只看 GPU Load，而应综合 Queue、Prefill、KV Transfer、Decode Queue、KV Capacity、Prefix Cache Locality、Expected ITL/TTFT 等因素。
+- Cache-aware Routing 是 P/D Serving 中的重要调度维度。
+
+## 本轮纠正
+
+- Memory Bandwidth 不是 KV Cache Size 的直接决定因素；需要区分 Compute、Memory Capacity、Memory Bandwidth。
+- “局部 KV Transfer”不等于“Decode 可以无条件提前执行”；必须保证当前 Attention 所需 KV 已 Ready。
+
+## 下一步
 
 ```text
-Chunked Prefill
-↓
-Prefill / Decode 资源冲突
-↓
-PD Disaggregation
-↓
 KV Cache Transfer
-↓
-TTFT / ITL / Throughput
+→ GPU → GPU / GPU → CPU → GPU / GPU → NIC → RDMA → NIC → GPU
+→ PCIe / NVLink / RDMA / InfiniBand / RoCE
+→ KV Connector
+→ Transfer Bandwidth / Latency 估算
+→ TTFT / ITL / Throughput
 ```
 
 ---
@@ -807,74 +939,7 @@ Model Serving
 
 ---
 
-# 10. Session 2026-08-30
-
-## 本次主题
-
-```text
-Continuous Batching
-→ Chunked Prefill
-→ Paged KV Cache / PagedAttention
-→ KV Block / Block Size
-→ Prefix Cache 引用计数
-→ Admission Control
-→ Eviction / Offloading / Preemption
-```
-
-## 已掌握
-
-- Static Batch 的主要问题是 Batch 成员不能灵活进出，长 Request 会拖住短 Request。
-- Decode 是持续逐步推进的 token generation，因此很适合 Continuous Batching。
-- 长 Prefill 会与 Decode 抢 GPU，Chunked Prefill 通过切分 Prefill 工作量降低对 Decode 的阻塞。
-- Chunk Size 与 KV Block Size 是两个不同层次的粒度。
-- KV Cache 适合使用固定大小 Block 管理，使逻辑连续、物理不连续。
-- Block Table 用于完成 Logical Block → Physical Block 的映射。
-- Block Size 存在内部碎片、元数据、访问效率之间的 Trade-off。
-- Prefix Cache 可以继续持有 Request 已结束后留下的共享 KV Block，因此 Request 与 KV Cache 生命周期可以分离。
-- ref_count = 0 才真正具备释放 Block 的资格。
-- Admission Control 需要同时考虑 Prefix Cache 命中、新增 KV、Running Request 后续 Decode 增长和当前 GPU KV Capacity。
-- Preemption 可以通过 Recompute 或 Offload 两种思路在显存、计算、数据搬运之间做 Trade-off。
-
-## 新增理解
-
-```text
-LLM Serving Scheduler
-不是简单的 FIFO 或 Batch Builder
-
-而是一个持续运行的资源控制闭环：
-
-Request
-→ Admission
-→ Prefill / Decode Scheduling
-→ KV Block Allocation
-→ GPU Execution
-→ Completion / Preemption
-→ KV Release / Cache / Offload
-→ 下一轮重新决策
-```
-
-## 仍然需要深入
-
-- token-level scheduler 的具体实现
-- Prefill 与 Decode 在 GPU 上的真实算子 / 张量组织差异
-- PagedAttention Kernel 如何使用 Block Table
-- KV Cache 容量的精确估算公式
-- TTFT / ITL / Throughput 的定量关系
-- Preemption / Offloading 在真实 Serving 框架里的策略差异
-- PD Disaggregation 与 KV Transfer
-
-## 下一步
-
-```text
-Prefill / Decode Disaggregation
-→ KV Cache Transfer
-→ TTFT / ITL / Throughput
-→ 完整 LLM Serving 架构
-```
-
----
-
-# 11. 给未来 ChatGPT 会话的启动指令
+# 10. 给未来 ChatGPT 会话的启动指令
 
 把下面这段直接贴到新会话：
 
@@ -888,7 +953,7 @@ Prefill / Decode Disaggregation
 > 3. 每个概念都要说明“为什么需要”以及“解决什么瓶颈”；
 > 4. 主动指出我的理解中不严谨或错误的地方；
 > 5. 适当使用简化实现、伪代码和架构图；
-> 6. 当前从 Disaggregated Prefill / Decode 继续，并持续连接 TTFT / ITL / Throughput / KV Transfer；
+> 6. 当前从 KV Cache Transfer 继续，并持续连接 TTFT / ITL / Throughput；
 > 7. 每完成一个主题，更新 Learning State，便于下一次会话继续。
 >
 > 以下是当前学习档案：
