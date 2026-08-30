@@ -95,8 +95,6 @@ KV Cache Transfer
 
 ## 3.1 Token 顺序
 
-已经形成的核心理解：
-
 ```text
 Token 是模型实际处理的离散输入单位。
 
@@ -112,8 +110,6 @@ Token 顺序不是无关紧要的：
 ---
 
 ## 3.2 KV Cache
-
-已经理解：
 
 在 autoregressive decode 中：
 
@@ -139,8 +135,6 @@ Token 顺序不是无关紧要的：
 
 ## 3.3 Prefix Cache
 
-已经形成基本理解：
-
 对于完全相同的 prefix：
 
 ```text
@@ -151,21 +145,7 @@ Request B
 [固定前缀][另一段输入]
 ```
 
-固定前缀可以：
-
-```text
-第一次：
-prefix
-  ↓
-prefill
-  ↓
-得到 prefix KV
-
-后续：
-直接复用 prefix KV
-  ↓
-只计算新增部分
-```
+第一次计算 prefix KV，后续请求可以复用，只计算新增部分。
 
 核心收益：
 
@@ -175,11 +155,11 @@ prefill
 → 提高并发条件下的有效吞吐
 ```
 
+并已认识到 Prefix Cache 不只是计算优化，也会影响新 Request 需要新增多少 KV Block，从而影响 Admission Control。
+
 ---
 
 ## 3.4 Continuous Batching
-
-已经形成核心理解：
 
 ```text
 Static / 传统 Batch
@@ -203,7 +183,7 @@ Request 甚至可以被 Preempt 后恢复
 
 > **Batch 成员可以持续动态变化，Scheduler 每一轮重新决定当前 GPU 应该处理哪些 Request。**
 
-已理解的原因：
+已理解：
 
 ```text
 LLM Decode 是逐步 autoregressive 的
@@ -214,7 +194,7 @@ LLM Decode 是逐步 autoregressive 的
 → 短请求结束后 GPU / batch slot 利用率下降
 ```
 
-仍需细化：
+仍可继续细化：
 
 - token-level scheduling
 - batch 中不同 sequence length 的实际张量组织
@@ -223,8 +203,6 @@ LLM Decode 是逐步 autoregressive 的
 ---
 
 ## 3.5 Chunked Prefill
-
-已经理解：
 
 ```text
 长 Prompt
@@ -248,7 +226,7 @@ Chunked Prefill：
 与 Decode 交错调度
 ```
 
-已经理解 Chunk Size 的 Trade-off：
+Chunk Size Trade-off：
 
 ```text
 Chunk 太大
@@ -280,15 +258,6 @@ Chunk 太小
 → 生命周期不同
 ```
 
-如果要求连续显存：
-
-```text
-容易产生外部碎片
-→ 总空闲显存很多
-→ 但连续空间不够
-→ 扩容可能需要搬迁
-```
-
 Paged KV Cache：
 
 ```text
@@ -301,7 +270,7 @@ Block Table
 Physical KV Blocks
 ```
 
-已经理解：
+例如：
 
 ```text
 Logical Block 0 → Physical Block 17
@@ -309,7 +278,7 @@ Logical Block 1 → Physical Block 3
 Logical Block 2 → Physical Block 42
 ```
 
-所以逻辑上连续、物理上可以不连续。
+因此逻辑上连续、物理上可以不连续。
 
 核心收益：
 
@@ -381,15 +350,9 @@ ref_count = 0
 
 ## 3.9 Admission Control
 
-已经开始建立 Scheduler 的资源视角：
+已经建立 Scheduler 的资源视角：
 
-当新 Request D 到来时，不能只看：
-
-```text
-D Prefill 当前需要多少显存
-```
-
-还要考虑：
+新 Request 不能只看当前 Prefill 的显存需求，还要考虑：
 
 ```text
 Prefix Cache 命中多少
@@ -421,11 +384,22 @@ Request D
 
 > **不能把“Prefill 时新增 KV 的容量需求”误认为 Request 的全部未来显存需求。**
 
+进一步形成了 Reserved Capacity 思维：
+
+```text
+Admissible Capacity
+≈
+Capacity
+- Active KV
+- Protected / Cached KV
+- Reserved KV Growth
+```
+
+实际系统不会机械地预留全部未来 token，但 Scheduler 必须考虑未来 Decode 增长，而不是只看瞬时 free memory。
+
 ---
 
 ## 3.10 KV Cache Eviction / Offloading / Preemption
-
-已经理解三者需要区分。
 
 ### Finished Request
 
@@ -476,7 +450,7 @@ Request 逻辑状态保留
 未来 Resume
 ```
 
-Preemption 的两种思路：
+Preemption 两种主要思路：
 
 ```text
 1. Recompute
@@ -506,11 +480,31 @@ Request State
 KV State
 ```
 
+已经认识到 Preemption 是资源交换问题：
+
+```text
+GPU Memory ↓
+↔
+Compute ↑ 或 Transfer ↑
+```
+
+Scheduler 需要考虑：
+
+```text
+KV 占用
++
+恢复成本
++
+Request Priority
++
+当前进度
++
+等待时间
+```
+
 ---
 
 ## 3.11 Prefill / Decode Disaggregation
-
-已形成核心理解：
 
 传统 Aggregated Serving：
 
@@ -539,8 +533,6 @@ Router
 
 ### P/D 为什么可以分离
 
-Prefill 与 Decode 的资源特征不同：
-
 ```text
 Prefill
 → 大量输入 token
@@ -556,7 +548,7 @@ Decode
 
 ### P/D 不均衡
 
-已经理解这是一个 Pipeline Balance 问题：
+已经理解这是 Pipeline Balance 问题：
 
 ```text
 P 很慢
@@ -565,7 +557,7 @@ P 很慢
 → 也无法对该 Request 开始 Decode
 ```
 
-所以 P/D 分离把原本 GPU 内部的资源竞争转化为：
+P/D 分离把原本 GPU 内部的资源竞争转化为：
 
 ```text
 Producer（Prefill）
@@ -575,9 +567,9 @@ Intermediate Result（KV）
 Consumer（Decode）
 ```
 
-### KV Transfer 成为新的关键路径
+### KV Transfer 成为关键路径
 
-第一次输出的路径可以抽象为：
+第一次输出路径可抽象为：
 
 ```text
 Queue
@@ -595,11 +587,9 @@ TTFT
 ≈ Queue + Prefill + KV Transfer + Decode Admission + First Decode
 ```
 
-已经理解 Critical Path 思维：如果 KV Transfer 占据主要时间，继续单独优化 Prefill 的边际收益会明显下降。
+已经形成 Critical Path 思维：如果 KV Transfer 占主要时间，继续单独优化 Prefill 的边际收益会明显下降。
 
 ### Block-level KV Transfer
-
-已经把 Paged KV / KV Block 与 P/D 分离连接起来：
 
 ```text
 P 产生 KV Blocks
@@ -609,7 +599,7 @@ Block-level Transfer
 D 的 KV Block Pool
 ```
 
-KV Block 可以抽象出：
+KV Block 可抽象为：
 
 ```text
 PRODUCED
@@ -623,9 +613,9 @@ ACTIVE
 RELEASED / EVICTED
 ```
 
-已经认识到：
+关键理解：
 
-> “KV 局部 Transfer”不等于“Decode 可以无条件立即开始”。Decode 所依赖的历史 KV Block 必须在对应计算需要前 Ready。
+> **“KV 局部 Transfer”不等于“Decode 可以无条件提前开始”。当前 Decode 所依赖的 KV Blocks 必须在对应计算需要前 READY。**
 
 ### Router / Cache-aware Routing
 
@@ -654,6 +644,108 @@ Cost(P, D, Request)
 已经形成：
 
 > **Cache-aware Routing**：Prefix Cache 命中位置本身就是路由决策的一部分。
+
+---
+
+## 3.12 KV Transfer / P-D Disaggregation 的进一步校准
+
+本轮通过题目推演进一步确认：
+
+### P/D 是 Producer / Consumer 关系
+
+```text
+P = Producer
+D = Consumer
+KV = Intermediate Result
+```
+
+因此：
+
+```text
+P 很慢
+→ KV 未 Ready
+→ D 即使有资源也无法对该 Request Decode
+```
+
+P/D 不均衡本质上是 Pipeline Balance 问题，而不仅是 GPU utilization 问题。
+
+### Critical Path
+
+如果：
+
+```text
+Prefill = 20ms
+KV Transfer = 120ms
+```
+
+即使 Prefill 从 20ms 优化到 10ms，整个请求 TTFT 的收益仍会被 120ms Transfer 主导。
+
+应优先识别：
+
+```text
+哪一个环节位于关键路径？
+哪一个环节占主要 latency？
+```
+
+### 局部 KV Transfer
+
+可以采用 Block 级 Transfer 状态：
+
+```text
+B0 = READY
+B1 = READY
+B2 = READY
+B3 = READY
+B4 = WAITING
+B5 = TRANSFERRING
+B6 = WAITING
+B7 = WAITING
+```
+
+但需要严格区分：
+
+> **局部完成 Transfer ≠ 当前 Decode 无条件可执行。**
+
+必须保证当前 Attention 所依赖的 KV Blocks 在计算前 READY。
+
+因此 KV Block Manager 不只是显存分配器，还可视为：
+
+```text
+KV Block 生命周期
++
+所有权 / 位置
++
+Transfer 状态
++
+Ready 状态
+```
+
+### Memory Capacity / Bandwidth / Compute 三者分离
+
+已经纠正一个概念：
+
+```text
+Compute
+→ 决定计算耗时
+
+Memory Capacity
+→ 决定能容纳多少 KV Cache
+
+Memory Bandwidth
+→ 决定 KV / 权重等数据搬运吞吐
+```
+
+KV Cache Size 主要受：
+
+```text
+token 数量
+× layers
+× KV heads
+× head dimension
+× bytes per element
+```
+
+影响，而不是由显存带宽直接决定。
 
 ---
 
@@ -782,13 +874,9 @@ Memory Bandwidth
 → KV / 权重数据搬运吞吐
 ```
 
-KV Cache Size 主要由 token 数、层数、KV heads、head dimension、数据类型等决定。
-
 ---
 
 # 6. 当前学习顺序
-
-已完成 / 正在深化：
 
 ```text
 ① Continuous Batching                ✅ 已形成核心理解
@@ -813,16 +901,18 @@ KV Cache Size 主要由 token 数、层数、KV heads、head dimension、数据�
         ↓
 ⑪ KV Cache Transfer                  ⏳ 下一环
         ↓
-⑫ TTFT / ITL / Throughput            ⏳ 后续定量深化
+⑫ GPU Interconnect / Networking      ⏳ 后续
         ↓
-⑬ LLM Serving                        ⏳ 后续
+⑬ TTFT / ITL / Throughput 定量分析   ⏳ 后续
+        ↓
+⑭ LLM Serving 架构                   ⏳ 后续
 ```
 
 ---
 
 # 7. Session 2026-08-30
 
-## 本次主题
+## 本次阶段主题
 
 ```text
 Continuous Batching
@@ -833,31 +923,47 @@ Continuous Batching
 → Admission Control
 → Eviction / Offloading / Preemption
 → Prefill / Decode Disaggregation
+→ KV Transfer / Cache-aware Routing
 ```
 
-## 本轮新增理解
+## 本阶段已经通过问答验证的能力
 
-- P/D Disaggregation 把 Prefill 与 Decode 的资源竞争转化为 Producer → KV → Consumer 的流水线依赖。
-- P/D 不均衡本质上是 Pipeline Balance 问题；P 很慢时，D 即使有资源也可能因为 KV 未 Ready 而无法 Decode。
-- KV Transfer 进入 TTFT 的关键路径，不能只优化 Prefill 而忽略 Transfer。
-- KV 可以以 Block 为粒度进行 Transfer / Ready 状态管理，但 Decode 只能在其当前依赖的 KV Blocks Ready 后执行。
-- Router 不应只看 GPU Load，而应综合 Queue、Prefill、KV Transfer、Decode Queue、KV Capacity、Prefix Cache Locality、Expected ITL/TTFT 等因素。
-- Cache-aware Routing 是 P/D Serving 中的重要调度维度。
+- 能从 Request 状态和 KV 状态两个层面分析 Serving 生命周期。
+- 能区分 Finished、Eviction、Offloading、Preemption。
+- 能理解 Admission 需要考虑未来 Decode 的 KV 增长与 Reserved Capacity。
+- 能理解 Chunk Size 与 KV Block Size 是不同维度。
+- 能把 Paged KV Block 管理与 Prefix Cache / Preemption / P-D Disaggregation 联系起来。
+- 能从 Producer → KV → Consumer 的角度理解 P/D Disaggregation。
+- 能识别 KV Transfer 是 TTFT 的关键路径，并做 Critical Path 分析。
+- 能意识到 KV 可以按 Block 粒度 Transfer，但 Decode 必须等待自身 Attention 所依赖的 Block Ready。
+- 能从 Cache Locality、KV Capacity、Transfer Distance、Decode Batch、Expected TTFT / ITL 等维度思考 Router，而不是只看 GPU utilization。
 
-## 本轮纠正
+## 下一步精确入口
 
-- Memory Bandwidth 不是 KV Cache Size 的直接决定因素；需要区分 Compute、Memory Capacity、Memory Bandwidth。
-- “局部 KV Transfer”不等于“Decode 可以无条件提前执行”；必须保证当前 Attention 所需 KV 已 Ready。
+# KV Cache Transfer / GPU Interconnect / Networking
 
-## 下一步
+需要学习：
 
 ```text
-KV Cache Transfer
-→ GPU → GPU / GPU → CPU → GPU / GPU → NIC → RDMA → NIC → GPU
-→ PCIe / NVLink / RDMA / InfiniBand / RoCE
-→ KV Connector
-→ Transfer Bandwidth / Latency 估算
-→ TTFT / ITL / Throughput
+GPU → GPU
+GPU → CPU → GPU
+GPU → NIC → RDMA → NIC → GPU
+
+PCIe
+NVLink
+InfiniBand
+RoCE
+NCCL
+KV Connector
+```
+
+重点回答：
+
+```text
+8GB KV 到底怎么从 Prefill GPU 搬到 Decode GPU？
+KV Transfer 的瓶颈由什么决定？
+带宽与延迟如何估算？
+Block-level Transfer 如何与 Scheduler / Block Manager 协同？
 ```
 
 ---
@@ -936,26 +1042,3 @@ Scheduler
 Agent Runtime
 Model Serving
 ```
-
----
-
-# 10. 给未来 ChatGPT 会话的启动指令
-
-把下面这段直接贴到新会话：
-
-> 我在进行长期 AI 系统学习。
->
-> 请把下面的 AI Learning State 当作我的学习进度，不要重复已经掌握的基础内容。
->
-> 教学要求：
-> 1. 从当前进度继续；
-> 2. 不只讲定义，要讲原理、数据流、GPU 计算、显存、调度和工程实现；
-> 3. 每个概念都要说明“为什么需要”以及“解决什么瓶颈”；
-> 4. 主动指出我的理解中不严谨或错误的地方；
-> 5. 适当使用简化实现、伪代码和架构图；
-> 6. 当前从 KV Cache Transfer 继续，并持续连接 TTFT / ITL / Throughput；
-> 7. 每完成一个主题，更新 Learning State，便于下一次会话继续。
->
-> 以下是当前学习档案：
->
-> [粘贴本文件内容]
