@@ -3,7 +3,7 @@
 > 用途：AI 长期学习存档。
 > 规则：新会话开始时先读取本文件；不要重复已经掌握的内容；优先从“当前学习位置”继续。
 >
-> 最后更新：2026-08-30
+> 最后更新：2026-08-31
 
 ---
 
@@ -157,6 +157,61 @@ Request B
 
 并已认识到 Prefix Cache 不只是计算优化，也会影响新 Request 需要新增多少 KV Block，从而影响 Admission Control。
 
+### Prefix Cache 的共享 Block 模型
+
+Prefix Cache 更准确的理解是“可复用的 KV Block”，而不是另一套独立的 KV 数据。
+
+```text
+                 Shared Prefix Blocks
+              ┌───────────────┐
+              │ B1 B2 B3 B4   │
+              └───────┬───────┘
+                  ┌───┴───┐
+                  ▼       ▼
+                 R1       R2
+```
+
+多个 Request 可以共享同一组 Prefix KV Blocks，核心机制是**引用而不是复制**。
+
+例如：
+
+```text
+B1.ref_count = 2
+B2.ref_count = 2
+B3.ref_count = 2
+B4.ref_count = 2
+```
+
+R1 完成后：
+
+```text
+ref_count: 2 → 1
+```
+
+R2 也完成后：
+
+```text
+ref_count: 1 → 0
+→ 具备回收到 Free Pool 的资格
+```
+
+因此：
+
+> **Prefix Cache 是 KV Block 的一种复用 / 生命周期管理策略，而不是完全独立于 KV Cache 的第二套数据。**
+
+还需要区分：
+
+```text
+Active KV
+→ 正在被运行请求引用
+
+Cached KV
+→ 当前没有运行请求使用，但保留用于未来 Prefix 命中
+
+Free Block
+→ 已无引用、可重新分配
+```
+
 ---
 
 ## 3.4 Continuous Batching
@@ -199,6 +254,25 @@ LLM Decode 是逐步 autoregressive 的
 - token-level scheduling
 - batch 中不同 sequence length 的实际张量组织
 - scheduler policy 的具体实现
+
+### Scheduler 的三层判断
+
+已经进一步建立：
+
+```text
+Admissible
+→ 系统资源是否允许接纳这个 Request？
+
+Ready
+→ Request 当前依赖是否已经满足，例如 KV 是否可用？
+
+Runnable
+→ 即使 Ready，本轮是否应该真正进入 GPU 执行？
+```
+
+核心关系：
+
+> **Ready 不等于 Runnable。**
 
 ---
 
@@ -346,6 +420,18 @@ ref_count = 0
 
 才真正具备进入 Free Pool 的资格。
 
+更精确的工程模型：
+
+```text
+Request Reference
+      ↓
+KV Block Reference
+      ↓
+Shared Prefix Cache
+```
+
+共享 Prefix 时优先通过 Block 引用关系复用，而不是复制整份 KV。
+
 ---
 
 ## 3.9 Admission Control
@@ -396,6 +482,19 @@ Capacity
 ```
 
 实际系统不会机械地预留全部未来 token，但 Scheduler 必须考虑未来 Decode 增长，而不是只看瞬时 free memory。
+
+并进一步区分：
+
+```text
+Free
+→ 当前没有任何引用，可以直接分配
+
+Cached / Evictable
+→ 当前保存数据，但在满足策略条件后可淘汰
+
+In-use
+→ 被活跃 Request 引用，不应直接淘汰
+```
 
 ---
 
@@ -749,6 +848,71 @@ token 数量
 
 ---
 
+## 3.13 Token Budget 与 Dynamic Scheduling
+
+已经通过题目进一步建立 Token Budget 思维：
+
+```text
+Sequence Slot
+≠
+Token Budget
+```
+
+例如：
+
+```text
+8 个 Request × 1 token
+= 8 token work
+
+4 个 Request × 2 token
+= 8 token work
+```
+
+Scheduler 可以把“本轮允许消耗多少计算工作”抽象为预算，而不是只看当前 Request 数量。
+
+在本轮预算已经用满时，即使新 Request 已 READY：
+
+```text
+Token Budget 已耗尽
+→ 本轮不能继续增加计算工作
+→ 下一轮再考虑
+```
+
+但 Token Budget 并非 GPU 固定硬件寄存器，而是 Scheduler 根据系统能力、QoS、Prefill / Decode Mix 等动态设定的调度上限。
+
+### Prefill 与 Decode 共用预算
+
+例如：
+
+```text
+Token Budget = 8
+
+Decode：R1 = 1
+Decode：R2 = 1
+Decode：R3 = 1
+
+已用 3
+剩余 5
+
+R4 Prefill Chunk = 5
+```
+
+于是形成：
+
+```text
+同一轮
+├─ Decode R1
+├─ Decode R2
+├─ Decode R3
+└─ Prefill R4 Chunk
+```
+
+这体现了 Chunked Prefill 与 Continuous Batching 的结合：
+
+> **长 Prefill 不必一次性独占 GPU，可以被切成 chunk，与 Decode 共享调度预算。**
+
+---
+
 # 4. 当前最重要的系统模型
 
 ```text
@@ -789,6 +953,20 @@ Chunked Prefill
 核心理解已经从“模型怎么跑”升级到：
 
 > **LLM Serving 本质上是在 GPU Compute、GPU KV Memory、CPU Memory、KV Transfer、Latency、Throughput 之间持续做资源调度。**
+
+进一步形成：
+
+```text
+Request State
++
+KV State
++
+Resource State
++
+Scheduler Decision
+```
+
+四个维度必须联动考虑。
 
 ---
 
@@ -874,6 +1052,44 @@ Memory Bandwidth
 → KV / 权重数据搬运吞吐
 ```
 
+## 误区 8：Ready 就一定应该本轮执行
+
+不准确。
+
+```text
+Ready
+→ 依赖满足
+
+Runnable
+→ Ready + 当前调度策略允许运行
+```
+
+Scheduler 还要结合：
+
+```text
+Token Budget
+Queue / Priority
+Latency Target
+KV Capacity
+Decode / Prefill Mix
+```
+
+## 误区 9：Prefix Cache 是一份独立于 KV Cache 的“第二缓存”
+
+不准确。
+
+更准确：
+
+```text
+KV Blocks
+   ↓
+共享 / 复用
+   ↓
+Prefix Cache
+```
+
+核心是 Block reuse / reference，而不是复制 KV。
+
 ---
 
 # 6. 当前学习顺序
@@ -906,6 +1122,14 @@ Memory Bandwidth
 ⑬ TTFT / ITL / Throughput 定量分析   ⏳ 后续
         ↓
 ⑭ LLM Serving 架构                   ⏳ 后续
+```
+
+补充：
+
+```text
+Scheduler 的 token-level scheduling
+→ 已建立概念模型
+→ 尚未深入真实框架的具体实现
 ```
 
 ---
@@ -968,7 +1192,108 @@ Block-level Transfer 如何与 Scheduler / Block Manager 协同？
 
 ---
 
-# 8. 学习方法
+# 8. Session 2026-08-31
+
+## 本次阶段主题
+
+```text
+Scheduler 状态判断
+→ Admissible / Ready / Runnable
+→ Token Budget
+→ Continuous Batching 的动态执行集合
+→ Chunked Prefill 与 Decode 共享调度预算
+→ Prefix Cache = 可共享 KV Blocks
+→ Block Reference / ref_count
+→ Cached / Free / In-use Block 生命周期
+→ Admission 与 Eviction 的关系
+```
+
+## 本次通过问答验证
+
+### 1. 静态 Batch 的主要问题
+
+选择：**B**
+
+已经确认：不同 Request 生命周期和输出长度不同，固定 Batch 容易被长请求拖住；短请求完成后又无法及时释放 Batch 资源。
+
+### 2. Ready Request 的选择
+
+在：
+
+```text
+D GPU 有空闲 slot
+R7：KV Ready
+R8：KV Transfer 中
+R9：KV Ready
+```
+
+有限 slot 下优先选择 R7 + R9，而不是只因为 R8 已经进入 Transfer 就强行运行。
+
+核心：
+
+> **依赖未满足的 Request 即使“正在准备”，也不是当前 Runnable Request。**
+
+### 3. Token Budget
+
+已经理解：
+
+```text
+Sequence Count
+≠
+Token Work Budget
+```
+
+当本轮预算已满时，新 Ready Request 通常需要等待下一轮，而不是无条件插入当前 iteration。
+
+### 4. Chunked Prefill
+
+当：
+
+```text
+Decode 已占 3 tokens
+总预算 = 8
+```
+
+剩余预算可以分给长 Prefill 的一个 chunk，例如：
+
+```text
+Decode 3
++
+Prefill Chunk 5
+=
+8
+```
+
+由此建立了：
+
+> **Prefill 与 Decode 可以成为同一个动态 Scheduler iteration 中的不同工作项。**
+
+### 5. Prefix Cache
+
+当两个 Request 有完全相同的 Prefix：
+
+```text
+R1 = [Prefix][Q1]
+R2 = [Prefix][Q2]
+```
+
+最合理的是：
+
+```text
+共享 Prefix KV Blocks
+R1 → Prefix Blocks + Q1 Blocks
+R2 → Prefix Blocks + Q2 Blocks
+```
+
+而不是复制整个 KV 或重新计算整个 Prefix。
+
+核心认知：
+
+> **Prefix Cache 的工程本质是共享 KV Block 的引用与生命周期管理。**
+
+---
+
+# 9. 学习方法
 
 每一个新概念都按照：
 
@@ -989,7 +1314,7 @@ Block-level Transfer 如何与 Scheduler / Block Manager 协同？
 
 ---
 
-# 9. 与个人技术方向的连接
+# 10. 与个人技术方向的连接
 
 当前 AI 学习不是孤立学习。
 
